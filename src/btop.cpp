@@ -214,7 +214,7 @@ void clean_quit(int sig) {
 	Global::quitting = true;
 	Runner::stop();
 	if (Global::_runner_started) {
-	#if defined __APPLE__ || defined __OpenBSD__ || defined __NetBSD__
+	#if defined __APPLE__ || defined __OpenBSD__ || defined __NetBSD__ || defined __ANDROID__
 		if (pthread_join(Runner::runner_id, nullptr) != 0) {
 			Logger::warning("Failed to join _runner thread on exit!");
 		}
@@ -227,11 +227,15 @@ void clean_quit(int sig) {
 	}
 
 #ifdef GPU_SUPPORT
+	#ifdef __ANDROID__
+	Gpu::Kgsl::shutdown();
+	#else
 	Gpu::Nvml::shutdown();
 	Gpu::Rsmi::shutdown();
 	Gpu::Asysfs::shutdown();
 	#ifdef __APPLE__
 	Gpu::AppleSilicon::shutdown();
+	#endif
 	#endif
 #endif
 

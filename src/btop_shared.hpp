@@ -190,6 +190,9 @@ namespace Gpu {
 	namespace Asysfs {
 		extern bool shutdown();
 	}
+	namespace Kgsl {
+		extern bool shutdown();
+	}
 	#ifdef __APPLE__
 	namespace AppleSilicon {
 		extern bool shutdown();
@@ -230,6 +233,7 @@ namespace Cpu {
 			{"guest_nice", {}}
 		};
 		vector<deque<long long>> core_percent;
+		vector<long long> core_freq_mhz;
 		vector<deque<long long>> temp;
 		long long temp_max = 0;
 		array<double, 3> load_avg;

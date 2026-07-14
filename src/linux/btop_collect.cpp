@@ -143,6 +143,7 @@ namespace Cpu {
 	vector<long long> core_old_totals;
 	vector<long long> core_old_idles;
 	vector<fs::path> core_freq;
+	vector<fs::path> per_core_freq;
 	vector<string> available_fields = {"Auto", "total"};
 	vector<string> available_sensors = {"Auto"};
 	cpu_info current_cpu;
@@ -317,6 +318,19 @@ namespace Gpu {
 		uint32_t device_count = 0;
 		vector<device_paths> devices;
 	}
+
+	//? Qualcomm KGSL GPU data collection used by Android devices.
+	namespace Kgsl {
+		const std::filesystem::path device{"/sys/class/kgsl/kgsl-3d0"};
+		bool initialized = false;
+		bool has_busy = false;
+		bool has_freq = false;
+		bool has_temp = false;
+		bool init();
+		bool shutdown();
+		template <bool is_init> bool collect(gpu_info* gpu_slice);
+		uint32_t device_count = 0;
+	}
 }
 
 #endif // GPU_SUPPORT
@@ -364,15 +378,32 @@ namespace Shared {
 
 		//? Init for namespace Cpu
 		Cpu::current_cpu.core_percent.insert(Cpu::current_cpu.core_percent.begin(), Shared::coreCount, {});
+		Cpu::current_cpu.core_freq_mhz.resize(Shared::coreCount, 0);
+		Cpu::per_core_freq.resize(Shared::coreCount);
+		for (int i = 0; i < Shared::coreCount; ++i) {
+			const fs::path frequency = "/sys/devices/system/cpu/cpu" + to_string(i) + "/cpufreq/scaling_cur_freq";
+			if (fs::exists(frequency) and access(frequency.c_str(), R_OK) == 0)
+				Cpu::per_core_freq[i] = frequency;
+		}
 		Cpu::current_cpu.temp.insert(Cpu::current_cpu.temp.begin(), Shared::coreCount + 1, {});
 		Cpu::core_old_totals.insert(Cpu::core_old_totals.begin(), Shared::coreCount, 0);
 		Cpu::core_old_idles.insert(Cpu::core_old_idles.begin(), Shared::coreCount, 0);
 
-		for (int i = 0; i < Shared::coreCount; ++i) {
-			Cpu::core_freq.push_back("/sys/devices/system/cpu/cpufreq/policy" + to_string(i) + "/scaling_cur_freq");
-			if (not fs::exists(Cpu::core_freq.back()) or access(Cpu::core_freq.back().c_str(), R_OK) == -1) {
-				Cpu::core_freq.pop_back();
+		const fs::path cpufreq_root{"/sys/devices/system/cpu/cpufreq"};
+		std::error_code cpufreq_ec;
+		if (fs::is_directory(cpufreq_root, cpufreq_ec)) {
+			for (const auto& entry : fs::directory_iterator(cpufreq_root, cpufreq_ec)) {
+				const auto name = entry.path().filename().string();
+				if (not name.starts_with("policy") or name.size() <= 6
+				or not std::ranges::all_of(name.begin() + 6, name.end(), [](char c) { return c >= '0' and c <= '9'; }))
+					continue;
+				const auto frequency = entry.path() / "scaling_cur_freq";
+				if (fs::exists(frequency) and access(frequency.c_str(), R_OK) == 0)
+					Cpu::core_freq.push_back(frequency);
 			}
+			std::ranges::sort(Cpu::core_freq, {}, [](const fs::path& path) {
+				return std::stoi(path.parent_path().filename().string().substr(6));
+			});
 		}
 
 		Cpu::collect();
@@ -391,6 +422,9 @@ namespace Shared {
 
 		//? Init for namespace Gpu
 	#ifdef GPU_SUPPORT
+	#ifdef __ANDROID__
+		Gpu::Kgsl::init();
+	#else
 		auto shown_gpus = Config::getS("shown_gpus");
 		if (shown_gpus.contains("nvidia")) {
 		    Gpu::Nvml::init();
@@ -404,6 +438,8 @@ namespace Shared {
 		if (shown_gpus.contains("intel")) {
 			Gpu::Intel::init();
 		}
+
+	#endif
 
 		if (not Gpu::gpu_names.empty()) {
 			for (auto const& [key, _] : Gpu::gpus[0].gpu_percent)
@@ -622,6 +658,34 @@ namespace Cpu {
 	}
 
 	static void update_sensors() {
+	#ifdef __ANDROID__
+		long long android_cpu_temp_sum = 0;
+		long long android_cpu_temp_count = 0;
+		for (auto& [name, sensor] : found_sensors) {
+			const auto separator = name.find('/');
+			const string_view label = separator == string::npos ? string_view{name} : string_view{name}.substr(separator + 1);
+			if (not label.starts_with("cpu-") and not label.starts_with("cpuss-")) continue;
+
+			long long raw_temp = 0;
+			try {
+				raw_temp = stoll(readfile(sensor.path, "0"));
+			} catch (const std::exception&) {
+				continue;
+			}
+			if (raw_temp <= 0 or raw_temp > 150'000) continue;
+			sensor.temp = raw_temp / 1000;
+			android_cpu_temp_sum += raw_temp;
+			android_cpu_temp_count++;
+		}
+		if (android_cpu_temp_count > 0) {
+			const long long average = std::llround(
+				(double)android_cpu_temp_sum / (double)android_cpu_temp_count / 1000.0);
+			current_cpu.temp.at(0).push_back(average);
+			current_cpu.temp_max = 95;
+			if (current_cpu.temp.at(0).size() > 20) current_cpu.temp.at(0).pop_front();
+			return;
+		}
+	#endif
 		if (cpu_sensor.empty()) return;
 
 		const auto& cpu_sensor = (not Config::getS("cpu_sensor").empty() and found_sensors.contains(Config::getS("cpu_sensor")) ? Config::getS("cpu_sensor") : Cpu::cpu_sensor);
@@ -836,6 +900,17 @@ namespace Cpu {
 		if (not has_battery) return {0, 0, 0, ""};
 		static string auto_sel;
 		static std::unordered_map<string, battery> batteries;
+		auto current_to_amps = [](float raw_current) {
+			const float magnitude = std::abs(raw_current);
+		#ifdef __ANDROID__
+			// Some Android vendor battery drivers expose current_now in mA even
+			// though the power_supply ABI normally specifies uA. Values below
+			// 100000 are implausibly small as uA while fast charging, so treat
+			// that range as mA. Standard-sized readings remain interpreted as uA.
+			if (magnitude > 0 and magnitude < 100000) return magnitude / 1000.0F;
+		#endif
+			return magnitude / 1000000.0F;
+		};
 
 		//? Get paths to needed files and check for valid values on first run
 		if (batteries.empty() and has_battery) {
@@ -876,14 +951,10 @@ namespace Cpu {
 							continue;
 						}
 
-						if (fs::exists(bat_dir / "power_now")) {
-							new_bat.power_now = bat_dir / "power_now";
-						}
-						else if ((fs::exists(bat_dir / "current_now")) and (fs::exists(bat_dir / "voltage_now"))) {
-							 new_bat.current_now = bat_dir / "current_now";
-							 new_bat.voltage_now = bat_dir / "voltage_now";
-						}
-						else {
+						if (fs::exists(bat_dir / "power_now")) new_bat.power_now = bat_dir / "power_now";
+						if (fs::exists(bat_dir / "current_now")) new_bat.current_now = bat_dir / "current_now";
+						if (fs::exists(bat_dir / "voltage_now")) new_bat.voltage_now = bat_dir / "voltage_now";
+						if (new_bat.power_now.empty() and (new_bat.current_now.empty() or new_bat.voltage_now.empty())) {
 							new_bat.use_power = false;
 						}
 
@@ -921,7 +992,6 @@ namespace Cpu {
 		int percent = -1;
 		long seconds = -1;
 		float watts = -1;
-
 		//? Try to get battery percentage
 		if (percent < 0) {
 			try {
@@ -1011,14 +1081,15 @@ namespace Cpu {
 		if (b.use_power) {
 			if (not b.power_now.empty()) {
 				try {
-					watts = stof(readfile(b.power_now, "-1")) / 1000000.0F;
+					watts = std::abs(stof(readfile(b.power_now, "-1"))) / 1000000.0F;
 				}
 				catch (const std::invalid_argument&) { }
 				catch (const std::out_of_range&) { }
 			}
-			else if (not b.voltage_now.empty() and not b.current_now.empty()) {
+			if (watts <= 0 and not b.voltage_now.empty() and not b.current_now.empty()) {
 				try {
-					watts = stof(readfile(b.current_now, "-1")) / 1000000.0F * stof(readfile(b.voltage_now, "1")) / 1000000.0F;
+					watts = current_to_amps(stof(readfile(b.current_now, "0")))
+						* stof(readfile(b.voltage_now, "0")) / 1000000.0F;
 				}
 				catch (const std::invalid_argument&) { }
 				catch (const std::out_of_range&) { }
@@ -1076,7 +1147,7 @@ namespace Cpu {
         return value;
     }
 
-    static constexpr auto detect_active_cpus() {
+    static auto detect_active_cpus() {
         auto stream = std::ifstream { "/sys/fs/cgroup/cpuset.cpus.effective" };
         auto buf = std::string { std::istreambuf_iterator<char> { stream }, {} };
 
@@ -1105,8 +1176,18 @@ namespace Cpu {
 		if (Runner::stopping or (no_update and not current_cpu.cpu_percent.at("total").empty())) return current_cpu;
 		auto& cpu = current_cpu;
 
-		if (Config::getB("show_cpu_freq"))
+		if (Config::getB("show_cpu_freq")) {
 			cpuHz = get_cpuHz();
+			if (cpu.core_freq_mhz.size() < per_core_freq.size()) cpu.core_freq_mhz.resize(per_core_freq.size(), 0);
+			for (size_t i = 0; i < per_core_freq.size(); ++i) {
+				if (per_core_freq[i].empty()) continue;
+				try {
+					cpu.core_freq_mhz[i] = stoll(readfile(per_core_freq[i], "0")) / 1000;
+				} catch (const std::exception&) {
+					cpu.core_freq_mhz[i] = 0;
+				}
+			}
+		}
 
 		if (getloadavg(cpu.load_avg.data(), cpu.load_avg.size()) < 0) {
 			Logger::error("failed to get load averages");
@@ -2211,6 +2292,90 @@ namespace Gpu {
 		template bool collect<1>(gpu_info*);
 	}
 
+	namespace Kgsl {
+		static long long read_ll(const std::filesystem::path& path, long long fallback = 0) {
+			try {
+				return std::stoll(readfile(path, std::to_string(fallback)));
+			} catch (const std::exception&) {
+				return fallback;
+			}
+		}
+
+		bool init() {
+			if (initialized) return false;
+			std::error_code ec;
+			if (not std::filesystem::is_directory(device, ec)) {
+				Logger::debug("KGSL: {} not present", device.string());
+				return false;
+			}
+
+			has_busy = std::filesystem::exists(device / "gpubusy");
+			has_freq = std::filesystem::exists(device / "devfreq/cur_freq")
+				or std::filesystem::exists(device / "gpuclk");
+			has_temp = std::filesystem::exists(device / "temp");
+			if (not (has_busy or has_freq or has_temp)) return false;
+
+			device_count = 1;
+			gpus.resize(gpus.size() + 1);
+			gpu_names.push_back("Qualcomm Adreno GPU");
+			initialized = true;
+			Logger::info("Using Android KGSL sysfs for Adreno GPU");
+			collect<1>(gpus.data() + gpus.size() - 1);
+			return true;
+		}
+
+		bool shutdown() {
+			initialized = false;
+			device_count = 0;
+			return true;
+		}
+
+		template <bool is_init> bool collect(gpu_info* gpu_slice) {
+			if (not initialized) return false;
+			auto& gpu = gpu_slice[0];
+			if constexpr (is_init) {
+				gpu.supported_functions = {
+					.gpu_utilization = has_busy,
+					.mem_utilization = false,
+					.gpu_clock = has_freq,
+					.mem_clock = false,
+					.pwr_usage = false,
+					.pwr_state = false,
+					.temp_info = has_temp,
+					.mem_total = false,
+					.mem_used = false,
+					.pcie_txrx = false,
+					.encoder_utilization = false,
+					.decoder_utilization = false,
+				};
+			}
+
+			if (has_busy) {
+				std::ifstream stream(device / "gpubusy");
+				long long busy = 0, total = 0;
+				stream >> busy >> total;
+				const long long percent = total > 0
+					? std::clamp((long long)std::llround((double)busy * 100.0 / (double)total), 0LL, 100LL)
+					: 0;
+				gpu.gpu_percent.at("gpu-totals").push_back(percent);
+			}
+			if (has_freq) {
+				const auto freq_path = std::filesystem::exists(device / "devfreq/cur_freq")
+					? device / "devfreq/cur_freq" : device / "gpuclk";
+				gpu.gpu_clock_speed = (unsigned int)(read_ll(freq_path) / 1'000'000);
+			}
+			if (has_temp) {
+				long long temperature = read_ll(device / "temp");
+				if (temperature > 1000) temperature /= 1000;
+				gpu.temp.push_back(temperature);
+			}
+			return true;
+		}
+
+		template bool collect<0>(gpu_info*);
+		template bool collect<1>(gpu_info*);
+	}
+
 	//? Collect data from GPU-specific libraries
 	auto collect(bool no_update) -> vector<gpu_info>& {
 		if (Runner::stopping or (no_update and not gpus.empty())) return gpus;
@@ -2218,10 +2383,15 @@ namespace Gpu {
 		// DebugTimer gpu_timer("GPU Total");
 
 		//* Collect data
+	#ifdef __ANDROID__
+		Kgsl::collect<0>(gpus.data());
+	#else
 		Nvml::collect<0>(gpus.data()); // raw pointer to vector data, size == Nvml::device_count
 		Rsmi::collect<0>(gpus.data() + Nvml::device_count); // size = Rsmi::device_count
 		Asysfs::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count); // size = Asysfs::device_count
 		Intel::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count); // size = Intel::device_count
+		Kgsl::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count + Intel::device_count);
+	#endif
 
 		//* Calculate average usage
 		long long avg = 0;

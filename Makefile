@@ -110,6 +110,10 @@ ifeq ($(GPU_SUPPORT),true)
 	override ADDFLAGS += -DGPU_SUPPORT
 endif
 
+ifeq ($(findstring android,$(shell $(CXX) -dumpmachine 2>/dev/null)),android)
+	override ADDFLAGS += -ffunction-sections -fdata-sections -Wl,--gc-sections
+endif
+
 #? Compiler and Linker
 ifeq ($(shell $(CXX) --version | grep clang >/dev/null 2>&1; echo $$?),0)
 	override CXX_IS_CLANG := true

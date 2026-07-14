@@ -723,6 +723,7 @@ namespace Cpu {
 					width_left -= (gpu.supported_functions.mem_used ? 5 : 0);
 					width_left -= (gpu.supported_functions.mem_total ? 6 : 0);
 					width_left -= (gpu.supported_functions.pwr_usage ? 6 : 0);
+					width_left -= (gpu.supported_functions.gpu_clock ? 9 : 0);
 					if (gpu.supported_functions.gpu_utilization) {
 						gpu_meters[i] = Draw::Meter{width_left, "cpu" };
 					}
@@ -766,7 +767,7 @@ namespace Cpu {
 		if (Config::getB("show_battery") and has_battery) {
 			static int old_percent{};   // defaults to = 0
 			static long old_seconds{};  // defaults to = 0
-			static float old_watts{};	// defaults to = 0
+		static float old_watts{};	// defaults to = 0
 			static string old_status;
 			static Draw::Meter bat_meter {10, "cpu", true};
 			static const std::unordered_map<string, string> bat_symbols = {
@@ -778,16 +779,16 @@ namespace Cpu {
 
 			const auto& [percent, watts, seconds, status] = current_bat;
 
-			if (redraw or percent != old_percent or (watts != old_watts and Config::getB("show_battery_watts")) or seconds != old_seconds or status != old_status) {
+		if (redraw or percent != old_percent or (watts != old_watts and Config::getB("show_battery_watts")) or seconds != old_seconds or status != old_status) {
 				old_percent = percent;
-				old_watts = watts;
+			old_watts = watts;
 				old_seconds = seconds;
 				old_status = status;
 				const string str_time = (seconds > 0 ? sec_to_dhms(seconds, false, true) : "");
 				const string str_percent = to_string(percent) + '%';
-				const string str_watts = (watts != -1 and Config::getB("show_battery_watts") ? fmt::format("{:.2f}", watts) + 'W' : "");
+			const string str_watts = (watts != -1 and Config::getB("show_battery_watts") ? fmt::format("{:.2f}", watts) + 'W' : "");
 				const auto& bat_symbol = bat_symbols.at((bat_symbols.contains(status) ? status : "unknown"));
-				const int current_len = (Term::width >= 100 ? 11 : 0) + str_time.size() + str_percent.size() + str_watts.size() + to_string(Config::getI("update_ms")).size();
+			const int current_len = (Term::width >= 100 ? 11 : 0) + str_time.size() + str_percent.size() + str_watts.size() + to_string(Config::getI("update_ms")).size();
 				const int current_pos = Term::width - current_len - 17;
 
 				if ((bat_pos != current_pos or bat_len != current_len) and bat_pos > 0 and not redraw)
@@ -797,7 +798,7 @@ namespace Cpu {
 
 				out += Mv::to(y, bat_pos) + title_left + Theme::c("title") + Fx::b + "BAT" + bat_symbol + ' ' + str_percent
 					+ (Term::width >= 100 ? Fx::ub + ' ' + bat_meter(percent) + Fx::b : "")
-					+ (not str_time.empty() ? ' ' + Theme::c("title") + str_time : "") + (not str_watts.empty() ? " " + Theme::c("title") + Fx::b + str_watts : "") + Fx::ub + title_right;
+				+ (not str_time.empty() ? ' ' + Theme::c("title") + str_time : "") + (not str_watts.empty() ? " " + Theme::c("title") + Fx::b + str_watts : "") + Fx::ub + title_right;
 			}
 		}
 		else if (bat_pos > 0) {
@@ -921,6 +922,11 @@ namespace Cpu {
 
 			out += enabled ? Theme::g("cpu").at(clamp(safeVal(cpu.core_percent, n).back(), 0ll, 100ll)) : Theme::c("inactive_fg");
 			out += rjust(to_string(safeVal(cpu.core_percent, n).back()), (b_column_size < 2 ? 3 : 4)) + Theme::c(enabled ? "main_fg" : "inactive_fg") + '%';
+			if (Config::getB("show_cpu_freq") and cmp_less(n, cpu.core_freq_mhz.size())) {
+				const auto frequency = cpu.core_freq_mhz[n];
+				out += Theme::c(enabled ? "title" : "inactive_fg")
+					+ (frequency > 0 ? ' ' + rjust(to_string(frequency), 4) + 'M' : "     -"s);
+			}
 
 			if (show_temps and not hide_cores) {
 				const auto core_temps = safeVal(cpu.temp, n + 1);
@@ -989,6 +995,10 @@ namespace Cpu {
 					out += rjust(to_string(safeVal(gpus[i].gpu_percent, "gpu-totals"s).back()), 3) + Theme::c("main_fg") + '%';
 					if (b_columns == 1)
 						out += ' ';
+				}
+				if (gpus[i].supported_functions.gpu_clock) {
+					out += Theme::c("title") + rjust(to_string(gpus[i].gpu_clock_speed), 5)
+						+ Theme::c("main_fg") + " MHz";
 				}
 				if (gpus[i].supported_functions.mem_used and gpus[i].supported_functions.mem_total and b_columns > 1) {
 					out += ' ' + Theme::c("inactive_fg") + graph_bg * 5 + Mv::l(5) + Theme::g("used").at(safeVal(gpus[i].gpu_percent, "gpu-vram-totals"s).back())
@@ -2313,7 +2323,8 @@ namespace Draw {
 				: Config::getS("show_gpu_info") == "Auto" ? Gpu::count - Gpu::shown
 				: 0;
 		#endif
-            const bool show_temp = (Config::getB("check_temp") and got_sensors);
+			const bool show_temp = (Config::getB("check_temp") and got_sensors);
+			const int core_freq_width = Config::getB("show_cpu_freq") ? 6 : 0;
 			width = round((double)Term::width * width_p / 100);
 		#ifdef GPU_SUPPORT
 			if (Gpu::shown != 0 and not (Mem::shown or Net::shown or Proc::shown)) {
@@ -2333,23 +2344,23 @@ namespace Draw {
 		#else
 			b_columns = max(1, (int)ceil((double)(Shared::coreCount + 1) / (height - 5)));
 		#endif
-			if (b_columns * (21 + 12 * show_temp) < width - (width / 3)) {
+			if (b_columns * (21 + core_freq_width + 12 * show_temp) < width - (width / 3)) {
 				b_column_size = 2;
-				b_width =  max(29, (21 + 12 * show_temp) * b_columns - (b_columns - 1));
+				b_width =  max(29, (21 + core_freq_width + 12 * show_temp) * b_columns - (b_columns - 1));
 			}
-			else if (b_columns * (15 + 6 * show_temp) < width - (width / 3)) {
+			else if (b_columns * (15 + core_freq_width + 6 * show_temp) < width - (width / 3)) {
 				b_column_size = 1;
-				b_width = (15 + 6 * show_temp) * b_columns - (b_columns - 1);
+				b_width = (15 + core_freq_width + 6 * show_temp) * b_columns - (b_columns - 1);
 			}
-			else if (b_columns * (8 + 6 * show_temp) < width - (width / 3)) {
+			else if (b_columns * (8 + core_freq_width + 6 * show_temp) < width - (width / 3)) {
 				b_column_size = 0;
 			}
 			else {
-				b_columns = (width - width / 3) / (8 + 6 * show_temp);
+				b_columns = (width - width / 3) / (8 + core_freq_width + 6 * show_temp);
 				b_column_size = 0;
 			}
 
-			if (b_column_size == 0) b_width = (8 + 6 * show_temp) * b_columns + 1;
+			if (b_column_size == 0) b_width = (8 + core_freq_width + 6 * show_temp) * b_columns + 1;
 		#ifdef GPU_SUPPORT
 			//gpus_extra_height = max(0, gpus_extra_height - 1);
 			b_height = min(height - 2, (int)ceil((double)Shared::coreCount / b_columns) + 4 + gpus_extra_height);
